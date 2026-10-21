@@ -1,0 +1,393 @@
+# -*- coding: utf-8 -*-
+import subprocess
+import time
+from datetime import datetime
+import os
+import sys
+import stat
+import numpy as np
+import csv
+import pandas as pd
+import logging
+import shutil
+
+    
+def main():
+    print("Welcome to the Autophagic Vacuole Simulation (AVS) Project")
+
+    while True:
+        print(">> Please select from the following options by entering the corresponding number:")
+        print("\t[1]: Run the full pipeline including CC3D with nested iterations over Body Number and Body Size")
+        print("\t[2]: Run vacuole_gen alone, with nested iterations but no PIFF file generation, for testing only")
+        print("\t[3]: Run vacuole_gen alone, with nested iterations but no CC3D, for making PIFF files")
+        print("\t[4]: Run Slice Stats directly on the vacuole_gen output, without deforming the bodies with CC3D")
+        print("\t[5]: Run Slice Stats alone")
+        print("\t[6]: Run AVS Stats alone, for analyzing data")     
+        print("\t[0]: Exit AVS")
+
+        scriptChoice = input()
+
+        if scriptChoice == "0":
+            print("--- Now exiting AVS ---")
+            sys.exit()
+        elif scriptChoice == "1":
+            run_pipeline(cc3d = True, PIFF = 1)   # PIFF files will be made for cc3d, but overwritten each run (not saved)
+        elif scriptChoice == "2":
+            run_pipeline(cc3d = False, PIFF = 0)  
+        elif scriptChoice == "3":
+            run_pipeline(cc3d = False, PIFF = 2)
+        elif scriptChoice == "4":
+            run_pipeline(cc3d = False, PIFF = 1, SliceTest = True) # For slicing the original spherical bodies, without deformation by cc3d
+        elif scriptChoice == "5":
+            run_SliceStats()
+        elif scriptChoice == "6":
+            run_AVSStats()
+        elif scriptChoice == "9":
+            read_readme()
+        else:
+            print("--- Invalid Input, please select one of the above options ---")
+
+
+def load_model_parameters(file_path="Model_Parameters.txt"):
+    params = {}
+    try:
+        with open(file_path, "r") as f:
+            for line in f:
+                line = line.split("#")[0].strip()
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    params[key.strip()] = value.strip()
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Error: Parameters file '{file_path}' not found.")
+    except Exception as e:
+        raise ValueError(f"Error reading parameters file: {e}")
+    
+    return params
+
+def get_list_to_iterate_over(start, end, step,endpoint=True):
+  n = (end - start) / step
+  if endpoint:
+    n += 1
+  if abs(n-round(n)) > 0.01:
+    print(f"Strange step size: start={start} end={end} step={step} n={n}")
+  return np.linspace(start, end, num=int(round(n)), endpoint=endpoint, dtype=float).tolist()
+
+
+def run_pipeline(cc3d = True, PIFF = 1, SliceTest = False):
+    """
+    Run pipeline iterating over Body Number and Body Size using nested loops.
+    """
+    
+    #Reset the (temporary) output folder that cc3d output PIFFs are stored in each iteration to be sliced by Slicestats
+    #This is to make sure that a PIFF file from a previous run doesn't accidentally get used instead
+    if not os.path.exists("./Output"):
+      os.makedirs("./Output")  
+
+    PIFFS = [file for file in os.listdir("./Output") if file.endswith(".piff")]
+    for f in PIFFS:
+      file_path = "./Output/"+str(f)
+      try:
+        os.remove(file_path)
+        print(f"{file_path} deleted successfully.")
+      except FileNotFoundError:
+        print("The file does not exist.")
+      except PermissionError:
+        print("Output folder permission denied.")
+     
+    #Create a directory to store the results in
+    runs_dir = 'runs'
+    if not os.path.exists(runs_dir):
+      os.makedirs(runs_dir)
+    
+    # Generate a unique overall ID based on the current date and time
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Create a new folder for this run
+    run_folder = os.path.join(runs_dir, run_id)
+    os.makedirs(run_folder)
+    
+    # Copy the parameters file into the run folder, for record keeping
+    param_dest = os.path.join(run_folder, os.path.basename("Model_Parameters.txt"))
+    shutil.copy("./attributes/Model_Parameters.txt", param_dest)   
+
+    #Intializing headers for vacuole data output csv file
+    vac_output_file = os.path.join(run_folder, 'Vacuole_Data_combined.csv')
+    
+    try:  
+        with open(vac_output_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            
+            # Columns of info to output
+            writer.writerow([
+                'Run_ID', 
+                'timestamp', 
+                'Seed', 
+                'Grid_Resolution_(dx)', 
+                'Body_Radius_Mu', 
+                'Body_Radius_Sigma',
+                'p-norm value', 
+                'Average_Body_Radius', 
+                'Standard_Deviation_Body_Radius',
+                'Largest_Body_Radius',
+                'Average_Distance_from_Origin',
+                'Body_Number_Mu',
+                'Body_Number_Sigma',  
+                'Number_of_Bodies_Requested', 
+                'Number_of_Bodies_Placed', 
+                'Success_Rate_(%)', 
+                'Iterations', 
+                'Optimization_Max_Iterations', 
+                'Starting_Objective_Function',
+                'Ending_Objective_Function',
+                'Optimization_Factor',
+                'Compactness',
+                'Wall_Radius_Mu', 
+                'Wall_Radius_Sigma', 
+                'Vacuole_Inner_Radius', 
+                'Vacuole_Volume', 
+                'Total_Body_Volume', 
+                'Packing_Density_(%)', 
+                'Maximum_Tries',
+                'Actual_Tries',
+                'Vacuole_x',
+                'Vacuole_y',
+                'Vacuole_z',
+                'slicePosition'
+                ]) 
+            
+    except Exception as e:
+        print(f"Error writing completely combined vacuole data CSV file")
+        raise
+                
+    params = load_model_parameters("./attributes/Model_Parameters.txt")
+    if not params:
+        raise ValueError("Failed to load parameters from Model_Parameters.txt.")
+
+  
+    # Initialize and reset sliceMeasurements.csv global copy 
+    slice_measurements_copy_path = "sliceData/sliceMeasurements.csv"
+    if os.path.exists(slice_measurements_copy_path):
+        os.remove(slice_measurements_copy_path)
+    
+    
+    # Validate loop parameters to prevent infinite loops 
+    assert float(params["Body_number_mu_step"]) > 0, "Body_number_mu_step must be > 0"
+    assert float(params["Body_number_ending_mu"]) >= float(params["Body_number_starting_mu"]), "Body_number_ending_mu must be >= than Body_number_starting_mu."
+
+    assert float(params["Body_number_sigma_step"]) > 0, "Body_number_sigma_step must be > 0"
+    assert float(params["Body_number_ending_sigma"]) >= float(params["Body_number_starting_sigma"]), "Body_number_ending_sigma must be >= than Body_number_starting_sigma."
+
+    assert float(params["Body_radius_mu_step"]) > 0, "Body_radius_mu_step must be > 0"
+    assert float(params["Body_radius_ending_mu"]) >= float(params["Body_radius_starting_mu"]), "Body_radius_ending_mu must be >= than Body_radius_starting_mu."
+
+    assert float(params["Body_radius_sigma_step"]) > 0, "Body_radius_sigma_step must be > 0"
+    assert float(params["Body_radius_ending_sigma"]) >= float(params["Body_radius_starting_sigma"]), "Body_radius_ending_sigma must be >= than Body_radius_starting_sigma."
+
+    sample_size = int(params["Sample_Size"])
+    
+    # Parameters for Wall mu and sigma 
+    wall_radius_mu = float(params["Wall_Radius_mu"])
+    wall_radius_sigma = float(params["Wall_Radius_sigma"])
+
+    # Parameters for Body Number iteration
+    mu_body_number_start = float(params["Body_number_starting_mu"])
+    mu_body_number_end = float(params["Body_number_ending_mu"])
+    mu_body_number_step = float(params["Body_number_mu_step"])
+    sigma_body_number_start = float(params["Body_number_starting_sigma"])
+    sigma_body_number_end = float(params["Body_number_ending_sigma"])
+    sigma_body_number_step = float(params["Body_number_sigma_step"])
+
+    # Parameters for Body Size iteration
+    mu_body_size_start = float(params["Body_radius_starting_mu"])
+    mu_body_size_end = float(params["Body_radius_ending_mu"])
+    mu_body_size_step = float(params["Body_radius_mu_step"])
+    sigma_body_size_start = float(params["Body_radius_starting_sigma"])
+    sigma_body_size_end = float(params["Body_radius_ending_sigma"])
+    sigma_body_size_step = float(params["Body_radius_sigma_step"])
+    pvals = float(params["pvals"])
+    
+    #Parameters for PIFF file generation
+    dx = float(params["Scale_Factor"])  #nm per voxel
+    show_wall = str(params["Show_Wall"])
+    xml_file_path = str(params["xml_file_path"])
+    Max_allowed_voxel_value = str(params["Max_allowed_voxel_value"])
+    
+    #Parameter for number of maximum iterations for optimization
+    optimmaxiter = int(params["optimmaxiter"])
+    
+    #Parameters for slicing
+    unScaledSliceThickness = str(params["unScaledSliceThickness"])        
+    unScaledVacMin = str(params["unScaledVacMin"])
+    
+    # Generate lists of values to iterate over
+    mu_body_number_list = get_list_to_iterate_over(mu_body_number_start, mu_body_number_end, mu_body_number_step)
+    sigma_body_number_list = get_list_to_iterate_over(sigma_body_number_start, sigma_body_number_end, sigma_body_number_step)
+    mu_body_size_list = get_list_to_iterate_over(mu_body_size_start, mu_body_size_end, mu_body_size_step)
+    sigma_body_size_list = get_list_to_iterate_over(sigma_body_size_start, sigma_body_size_end, sigma_body_size_step)
+
+    for mu_body_number in mu_body_number_list:
+        for sigma_body_number in sigma_body_number_list:
+            for mu_body_size in mu_body_size_list:
+                for sigma_body_size in sigma_body_size_list:
+                    for run_idx in range(sample_size):
+                        N_spheroids = int(np.random.lognormal(mean=mu_body_number, sigma=sigma_body_number))
+                        print(f"\nRunning pipeline with N={N_spheroids}, mu_body_number={mu_body_number}, sigma_body_number={sigma_body_number}, "
+                          f"mu_body_size={mu_body_size}, sigma_body_size={sigma_body_size}, scale_factor={dx}")
+                        timenow = time.strftime("%c")
+                        print(f"datetime: {timenow}") # it's nice to say when we started
+                        print(f"Sample {run_idx + 1}/{sample_size}")
+                        
+                        #Delete the cc3d input PIFF from the previous run
+                        print (f"xml_file_path {xml_file_path}")
+                        cc3d_folder = os.path.dirname(xml_file_path)
+                        print (f"cc3d_folder {cc3d_folder}")
+                        PIFFS = [file for file in os.listdir(cc3d_folder) if file.endswith(".piff")]
+                        for f in PIFFS:
+                          print (f"Piff file {f}")
+                          file_path = cc3d_folder+"/"+str(f)
+                          print (f"Piff file path {file_path}")
+                          try:
+                            os.remove(file_path)
+                            print(f"{file_path} deleted successfully.")
+                          except FileNotFoundError:
+                            print("The file does not exist.")
+                            
+                        #Run vacuole_gen    
+                        vacuolegenmain(
+                            run_folder = run_folder,
+                            N_spheroids=N_spheroids,
+                            mu_body_number=mu_body_number,
+                            sigma_body_number=sigma_body_number,
+                            mu_body_size=mu_body_size,
+                            sigma_body_size=sigma_body_size,
+                            pvals=pvals,
+                            wall_radius_mu=wall_radius_mu,
+                            wall_radius_sigma=wall_radius_sigma,
+                            dx=dx,
+                            show_wall=show_wall,
+                            optimmaxiter=optimmaxiter,
+                            PIFF=PIFF,
+                            unScaledSliceThickness=unScaledSliceThickness,
+                            unScaledVacMin=unScaledVacMin,
+                            xml_file_path=xml_file_path,
+                            Max_allowed_voxel_value=Max_allowed_voxel_value       
+                        )
+
+                        # Run CompuCell3D simulation (only if called for)
+                        if cc3d == True:
+                            cc3d_input_PIFF = str(cc3d_folder)+"/output.piff"    
+                            if os.path.exists(cc3d_input_PIFF):   # If PIFF file generation was skipped, we also skip running cc3d
+                                run_cc3d_script(params = params)
+                                run_SliceStats()
+                            else:
+                                print("A PIFF file was not generated, so cc3d and SliceStats will not be run")
+
+                        
+                        #Slice the original spherical bodies (if called for)
+                        if SliceTest == True:
+                            run_SliceStatsTest()
+                        
+
+    print("--- Pipeline execution complete ---")
+
+
+def vacuolegenmain(run_folder, N_spheroids, mu_body_number, sigma_body_number, mu_body_size, sigma_body_size, pvals, 
+                    wall_radius_mu, wall_radius_sigma, dx, show_wall, optimmaxiter, PIFF, unScaledSliceThickness, unScaledVacMin, xml_file_path,       
+                    Max_allowed_voxel_value):
+    """
+    Run vacuole_gen.py with specified parameters.
+    """
+    print(f"Running vacuole_gen with N={N_spheroids}, mu_body_size={mu_body_size}, sigma_body_size={sigma_body_size}")
+
+    command = [
+        sys.executable,
+        "vacuole_gen.py",
+        "--run_folder", str(run_folder),
+        "--N", str(N_spheroids),
+        "--mu", str(mu_body_size),
+        "--sigma", str(sigma_body_size),
+        "--pvals", str(pvals),
+        "--wall_radius_mu", str(wall_radius_mu),
+        "--wall_radius_sigma", str(wall_radius_sigma),
+        "--mu_body_number", str(mu_body_number),
+        "--sigma_body_number", str(sigma_body_number),
+        "--dx", str(dx),
+        "--show_wall", str(show_wall),
+        "--optimmaxiter", str(optimmaxiter),
+        "--PIFF", str(PIFF),
+        "--unScaledSliceThickness", str(unScaledSliceThickness),
+        "--unScaledVacMin", str(unScaledVacMin),
+        "--xml_file_path", str(xml_file_path),
+        "--Max_allowed_voxel_value", str(Max_allowed_voxel_value),
+        
+    ]
+
+    try:
+        subprocess.run(command, check=True)
+        print(f"vacuole_gen.py executed successfully with N={N_spheroids}, mu={mu_body_size}, sigma={sigma_body_size}")
+    except subprocess.CalledProcessError as e:
+        print(f"An error occurred while running vacuole_gen.py: {e}")
+
+def run_vacuole_gen():
+    """
+    Run vacuole_gen, iterating over Body Number and Body Size using nested loops to create PIFF files, but not squashing them with CC3D or sliceing with slicestats.
+    """    
+    run_pipeline(cc3d = False)
+    
+def run_cc3d_script(params):
+    print("Running CC3D simulation using runScript.sh...")
+    cc3d_folder = (os.path.dirname(os.path.dirname(os.path.dirname(params["xml_file_path"]))))
+    run_script = os.path.join(cc3d_folder, 'runScript.sh')
+
+    if not os.path.exists(run_script):
+        print(f"Error: runScript.sh not found in the {cc3d_folder} folder.")
+        return
+
+    st = os.stat(run_script)
+    os.chmod(run_script, st.st_mode | stat.S_IEXEC)
+
+    command = [run_script, '-i', './cc3dSimulation/CC3D_sim_for_AVS.cc3d', '-f', '100', '-o', './Output/', '-c', 'infoPrinter']
+
+    try:
+        start_time = time.time()
+        subprocess.run(command, check=True)
+        end_time = time.time()
+        print(f"CC3D simulation completed in {end_time - start_time:.2f} seconds.")
+    except subprocess.CalledProcessError as e:
+        print(f"An error occurred while running runScript.sh: {e}")
+
+
+def run_SliceStats():
+    print("Running SliceStats...")
+    command = [sys.executable, 'SliceStats.py']
+
+    try:
+        subprocess.run(command, check=True)
+        print("SliceStats executed successfully.")
+    except subprocess.CalledProcessError as e:
+        print(f"An error occurred while running SliceStats.py: {e}")
+
+def run_SliceStatsTest():
+    print("Running SliceStatsTest...")
+    command = [sys.executable, 'SliceStatsTest.py']
+
+    try:
+        subprocess.run(command, check=True)
+        print("SliceStatsTest executed successfully.")
+    except subprocess.CalledProcessError as e:
+        print(f"An error occurred while running SliceStatsTest.py: {e}")
+
+
+def run_AVSStats():
+    print("Running AVSStats...")
+    command = [sys.executable, 'AVSStats.py']
+
+    try:
+        subprocess.run(command, check=True)
+        print("AVSStats executed successfully.")
+    except subprocess.CalledProcessError as e:
+        print(f"An error occurred while running AVSStats.py: {e}")
+
+
+if __name__ == "__main__":
+    main()
