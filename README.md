@@ -115,7 +115,8 @@ To have Pipeline_Interface.py invoke cc3d we have to:
    ```bash
    #!/bin/bash
    SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
-   source ${SCRIPT_DIR}/miniconda3/bin/activate base
+   conda_dir=${SCRIPT_DIR}/miniforge3
+   source ${conda_dir}/bin/activate cc3d_env
    export exit_code=0
    python -m cc3d.run_script $* --current-dir=${SCRIPT_DIR}
    exit_code=$?
